@@ -162,13 +162,11 @@ class OxylabsFetcher:
                 response = await client.post(
                     OXYLABS_URL,
                     auth=(settings.oxylabs_user, settings.oxylabs_pass),
-                    json={"queries": [oxylabs_payload]},
+                    json=oxylabs_payload,  # Realtime API espera el objeto plano, no {"queries": [...]}
                     timeout=timeout + 5
                 )
                 response.raise_for_status()
                 data = response.json()
-                # La API de consultas únicas vs múltiples varía un poco
-                # Si se usa queries[], el resultado está en data["results"][0]["content"]
                 content = data["results"][0]["content"]
                 fetch_ms = int((time.monotonic() - start) * 1000)
 

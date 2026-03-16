@@ -249,6 +249,7 @@ def test_agentic_store_detail():
         "todas las tiendas de todas las categorías."
     )
     MIN_STORES_BASIC = 10
+    MIN_STORES_PLUS = 20  # BUG 6 FIX: variable no estaba definida → NameError en runtime
 
     stores, result = extract_plaza(PLAZA, URL, HINT, MIN_STORES_BASIC)
     save_navigation_snapshot(PLAZA)

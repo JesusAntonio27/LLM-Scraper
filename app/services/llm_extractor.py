@@ -393,7 +393,13 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             times = tool_input.get("times", 1)
             instructions = []
             for _ in range(times):
-                instructions.append({"type": "scroll_to_bottom"})
+                instructions.append({
+                    "type": "scroll",
+                    "coordinate_x": 0,
+                    "coordinate_y": 0,
+                    "scroll_direction": "down",
+                    "scroll_pages": 5
+                })
                 instructions.append({"type": "wait", "wait_time_s": 1})
             fetch_result = await fetcher.fetch(
                 url=current_url,
@@ -413,6 +419,8 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
                 browser_instructions=instructions,
                 **clean_opts
             )
+            if fetch_result["status"] == "failed":
+                return f"wait_and_get failed: {fetch_result['error']}"
             pre = preprocessor.process(fetch_result.get("html", ""))
             return pre["markdown"] or "Sin contenido"
 
@@ -551,6 +559,8 @@ Evalúa si este contenido es suficiente para extraer los datos del schema.
 Si lo es, usa finish() con el JSON. Si no, navega la página para obtenerlos."""
         }]
 
+        current_url = url  # rastrear la URL activa durante la navegación
+
         try:
             while iteration < max_iterations:
                 iteration += 1
@@ -638,8 +648,12 @@ Si lo es, usa finish() con el JSON. Si no, navega la página para obtenerlos."""
                         }
 
                     result = await self._execute_tool(
-                        tool_name, tool_input, url, fetch_options
+                        tool_name, tool_input, current_url, fetch_options
                     )
+
+                    # Actualizar current_url si el agente navegó a una nueva página
+                    if tool_name == "fetch_page" and tool_input.get("url"):
+                        current_url = tool_input["url"]
 
                     self._update_navigation_context(
                         context_file, iteration, tool_name, tool_input,

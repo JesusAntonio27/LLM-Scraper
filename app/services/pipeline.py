@@ -123,6 +123,10 @@ async def _process_single_url(url: str, schema: dict, output_hint: str, model: s
         pre_result.get("estimated_tokens") is None
     )
     
+    # BUG 7 FIX: path único por request para evitar race condition cuando hay concurrencia
+    import uuid
+    context_file = f"navigation_context_{uuid.uuid4().hex[:8]}.md"
+
     if force_agentic or auto_agentic:
         # Modo agentic — Claude navega con tools
         llm_result = await extractor.extract_agentic(
@@ -131,7 +135,7 @@ async def _process_single_url(url: str, schema: dict, output_hint: str, model: s
             schema=schema,
             output_hint=output_hint,
             fetch_options=fetch_options,
-            context_file="navigation_context.md"
+            context_file=context_file
         )
     else:
         # Modo normal — extracción directa
@@ -162,7 +166,8 @@ async def run_discover(request: dict) -> dict:
     Simplified flow for POST /extract/discover.
     """
     url = request.get("url", "")
-    output_hint = request.get("output_hint", "")
+    # BUG 4 FIX: DiscoverRequest serializa el campo como "hint", no "output_hint"
+    output_hint = request.get("hint", "") or request.get("output_hint", "")
     fetch_options = request.get("fetch_options", {})
     
     # 1. Fetch
@@ -196,7 +201,7 @@ async def run_discover(request: dict) -> dict:
         markdown=pre_result["markdown"],
         schema={}, # No initial schema
         output_hint=discover_hint,
-        model="claude-sonnet-4-6", # FORCED
+        model="sonnet",  # BUG 3 FIX: usar la key del MODEL_MAP, no el ID completo
         token_budget=4000
     )
     
