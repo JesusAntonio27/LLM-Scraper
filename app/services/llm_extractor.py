@@ -226,6 +226,10 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
         for key in schema.keys():
             if key not in data:
                 return False
+        # FIX 5: lista vacía no es una extracción válida — enmascara fallos reales
+        for value in data.values():
+            if isinstance(value, list) and len(value) == 0:
+                return False
         return True
 
     def _calculate_cost(self, model_id: str, input_tokens: int, output_tokens: int) -> float:
@@ -365,11 +369,19 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
 
         if tool_name == "fetch_page":
             url = tool_input.get("url", current_url)
+            # FIX 9: si ya visitamos esta URL, retornar el contenido cacheado
+            if url in self._visited_urls:
+                logger.info("fetch_page cache hit | url=%s", url)
+                return self._last_page_content or "Contenido vacío (cacheado)"
             fetch_result = await fetcher.fetch(url=url, **clean_opts)
             if fetch_result["status"] == "failed":
                 return f"Error fetching {url}: {fetch_result['error']}"
             pre = preprocessor.process(fetch_result["html"])
-            return pre["markdown"] or "Contenido vacío"
+            content = pre["markdown"] or "Contenido vacío"
+            # FIX 3: actualizar caché de contenido y marcar URL como visitada
+            self._last_page_content = content
+            self._visited_urls.add(url)
+            return content
 
         elif tool_name == "click_element":
             instructions = [{
@@ -387,10 +399,15 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             if fetch_result["status"] == "failed":
                 return f"Click failed: {fetch_result['error']}"
             pre = preprocessor.process(fetch_result["html"])
-            return pre["markdown"] or "Sin cambios tras el click"
+            content = pre["markdown"] or "Sin cambios tras el click"
+            self._last_page_content = content  # FIX 3: actualizar caché
+            return content
 
         elif tool_name == "scroll_page":
             times = tool_input.get("times", 1)
+            # FIX 4: respetar el parámetro direction que el agente especificó
+            direction = tool_input.get("direction", "down")
+            scroll_pages = 10 if direction == "bottom" else 5
             instructions = []
             for _ in range(times):
                 instructions.append({
@@ -398,7 +415,7 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
                     "coordinate_x": 0,
                     "coordinate_y": 0,
                     "scroll_direction": "down",
-                    "scroll_pages": 5
+                    "scroll_pages": scroll_pages
                 })
                 instructions.append({"type": "wait", "wait_time_s": 1})
             fetch_result = await fetcher.fetch(
@@ -409,7 +426,9 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             if fetch_result["status"] == "failed":
                 return f"Scroll failed: {fetch_result['error']}"
             pre = preprocessor.process(fetch_result["html"])
-            return pre["markdown"] or "Sin cambios tras el scroll"
+            content = pre["markdown"] or "Sin cambios tras el scroll"
+            self._last_page_content = content  # FIX 3: actualizar caché
+            return content
 
         elif tool_name == "wait_and_get":
             seconds = tool_input.get("seconds", 2)
@@ -422,7 +441,9 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             if fetch_result["status"] == "failed":
                 return f"wait_and_get failed: {fetch_result['error']}"
             pre = preprocessor.process(fetch_result.get("html", ""))
-            return pre["markdown"] or "Sin contenido"
+            content = pre["markdown"] or "Sin contenido"
+            self._last_page_content = content  # FIX 3: actualizar caché
+            return content
 
         elif tool_name == "extract_links":
             fetch_result = await fetcher.fetch(url=current_url, **clean_opts)
@@ -432,6 +453,9 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             from urllib.parse import urljoin, urlparse
             soup = BeautifulSoup(fetch_result["html"], "html.parser")
             pattern = tool_input.get("pattern", "")
+            # FIX 6: si el patrón es URL completa, extraer solo el path para comparar con hrefs relativos
+            if pattern.startswith("http"):
+                pattern = urlparse(pattern).path
             base = f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}"
             links = []
             for a in soup.find_all("a", href=True):
@@ -443,9 +467,15 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             return str(links) if links else "[]"
 
         elif tool_name == "get_current_content":
+            # FIX 3: usar el caché del último fetch — sin llamada extra a Oxylabs
+            if self._last_page_content:
+                return self._last_page_content
+            # Fallback: primer uso antes de cualquier fetch
             fetch_result = await fetcher.fetch(url=current_url, **clean_opts)
             pre = preprocessor.process(fetch_result.get("html", ""))
-            return pre["markdown"] or "Sin contenido"
+            content = pre["markdown"] or "Sin contenido"
+            self._last_page_content = content
+            return content
 
         elif tool_name == "finish":
             return "__FINISH__"
@@ -459,7 +489,8 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
                 url=url,
                 method=method,
                 payload=payload,
-                geo_location=fetch_options.get("geo_location", "Mexico")
+                geo_location=fetch_options.get("geo_location", "Mexico"),
+                timeout=fetch_options.get("timeout", 30)  # FIX 8: heredar timeout del request
             )
 
             if result["status"] == "failed":
@@ -503,15 +534,19 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
         total_output_tokens = 0
         iteration = 0
 
+        # FIX 3: caché del último contenido fetchado — evita llamadas extra a Oxylabs en get_current_content
+        self._last_page_content: str = markdown  # inicializar con el markdown ya disponible
+        # FIX 9: URLs ya visitadas — evita re-fetchear la misma página
+        self._visited_urls: set = {url}  # la URL inicial ya fue fetchada por el pipeline
+
         self._init_navigation_context(context_file, url, schema, output_hint)
 
-        system = f"""Eres un agente de extracción web especializado en directorios de centros comerciales.
-Tienes acceso a tools para navegar páginas web y extraer datos estructurados.
+        system = f"""Eres un agente de extracción web. Tu objetivo es extraer datos estructurados de páginas web usando las tools disponibles.
+
+Contexto del sitio: {output_hint}
 
 Schema que debes poblar:
 {json.dumps(schema, indent=2, ensure_ascii=False)}
-
-Objetivo: {output_hint}
 
 REGLAS DE EXTRACCIÓN:
 - Evalúa primero si el contenido que ya tienes es suficiente.
@@ -520,10 +555,18 @@ REGLAS DE EXTRACCIÓN:
 - NUNCA inventes datos — usa null si un campo no existe.
 - Cuando tengas suficiente información, llama a finish().
 
+REGLA DE ACUMULACIÓN — CRÍTICA:
+Cada vez que extraes items de una página o categoría, RECUÉRDALOS.
+Cuando llames finish(), el JSON debe contener TODOS los items encontrados
+en TODAS las páginas/categorías visitadas, no solo los de la última.
+Antes de llamar finish(), verifica: ¿Incluí los datos de CADA sección visitada?
+Si no → sigue navegando hasta tenerlos todos.
+NO llames finish() después de la primera categoría — espera a tener TODAS.
+
 REGLAS DE NORMALIZACIÓN (MUY IMPORTANTE):
-- Los nombres de las tiendas deben ser legibles y naturales.
+- Los nombres deben ser legibles y naturales.
 - Ejemplo: "Dairy Queen" es correcto. "dairy-queen" (kebab-case) o "DAIRY QUEEN" (ALL CAPS) NO son correctos.
-- Si extraes nombres de URLs o selectores con guiones, conviértelos a mayúsculas iniciales y espacios (ej. "h-and-m" -> "H&M" o "H and M").
+- Si extraes nombres de URLs o selectores con guiones, conviértelos a mayúsculas iniciales y espacios (ej. "h-and-m" -> "H&M").
 
 CUÁNDO USAR give_up:
 Úsalo SOLO si se cumplen las dos condiciones juntas:
@@ -536,16 +579,19 @@ NO uses give_up si:
   - Hay texto en la página aunque sea de navegación.
   - No has probado call_api() todavía.
 
-PATRÓN: Sitio con menú de categorías (ej. Plaza Satélite)
-Si detectas un menú con categorías (Restaurantes, Moda, Servicios, etc.) pero el contenido principal está vacío:
-1. extract_links("/directorio" o el patrón del menú) -> obtener todas las URLs de categorías.
+PATRÓN: Sitio con menú de categorías
+Si detectas un menú con categorías pero el contenido principal está vacío:
+1. extract_links(patrón del menú) -> obtener todas las URLs de categorías.
 2. Si no hay URLs separadas, para cada categoría visible en el menú:
-   click_element(".categoria-selector" o el texto de la categoría)
+   click_element(selector de la categoría)
    wait_and_get(2)
-   get_current_content() -> acumular tiendas encontradas.
-3. Repetir para TODAS las categorías antes de llamar finish().
-4. finish() con todos los datos acumulados de todas las categorías.
-No llames finish() después de la primera categoría — espera a tener todas.
+   get_current_content() -> ACUMULAR items encontrados en memoria.
+3. Repetir para TODAS las categorías.
+4. finish() con TODOS los datos acumulados de todas las categorías.
+
+NOTA sobre get_current_content():
+Retorna el Markdown del último fetch realizado. Es instantáneo y gratuito.
+Úsalo para leer el estado actual sin gastar un fetch nuevo.
 """
 
         messages = [{
@@ -660,10 +706,18 @@ Si lo es, usa finish() con el JSON. Si no, navega la página para obtenerlos."""
                         result_summary=result[:200]
                     )
 
+                    # FIX 2: truncar tool results largos para evitar context explosion
+                    # ~2K tokens = ~8000 chars es suficiente para que el agente tome decisiones
+                    MAX_TOOL_RESULT_CHARS = 8000
+                    truncated_result = result if len(result) <= MAX_TOOL_RESULT_CHARS else (
+                        result[:MAX_TOOL_RESULT_CHARS] +
+                        f"\n\n[...contenido truncado — {len(result) - MAX_TOOL_RESULT_CHARS} chars omitidos para preservar contexto]"
+                    )
+
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": result
+                        "content": truncated_result
                     })
 
                 # Claude llamó finish()
