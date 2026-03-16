@@ -13,7 +13,9 @@ async def run(request: dict) -> dict:
     """
     # Extract fields with defaults
     urls = request.get("urls", [])
-    schema = request.get("schema", {})
+    # FIX F: Pydantic serializa Optional[dict] como None cuando no se envía —
+    # request.get("schema", {}) devuelve None igual, causando AttributeError en _validates_schema
+    schema = request.get("schema") or {}
     output_hint = request.get("output_hint", "")
     already_scraped = request.get("already_scraped", [])
     
@@ -117,10 +119,26 @@ async def _process_single_url(url: str, schema: dict, output_hint: str, model: s
     # ── Paso 4: Extracción LLM ──
     extractor = LLMExtractor()
     
-    # Determinar si activar modo agentic
+    # FIX A: auto_agentic anterior era casi-nunca-verdadero porque raw_html solo llega
+    # cuando trafilatura Y structural fallan — Oxylabs siempre renderiza algo (menú,
+    # footer) que pasa el umbral de 10 líneas. El trigger real es:
+    # 1. La estrategia terminó en raw_html (sin contenido extraíble), O
+    # 2. El schema pide listas PERO el markdown extraído es demasiado delgado (<300 tokens)
+    #    — esto cubre el caso: "tengo texto de navegación pero no tengo los datos reales".
+    def _schema_expects_list(s: dict) -> bool:
+        if not s:
+            return False
+        # JSON Schema estándar: properties con type=array
+        props = s.get("properties", {})
+        if any(isinstance(v, dict) and v.get("type") == "array" for v in props.values()):
+            return True
+        # Schema simple (dict plano): algún valor es una lista
+        return any(isinstance(v, list) for v in s.values())
+
+    content_tokens = pre_result.get("estimated_tokens") or 0
     auto_agentic = (
-        pre_result.get("strategy_used") == "raw_html" and
-        pre_result.get("estimated_tokens") is None
+        pre_result.get("strategy_used") == "raw_html" or
+        (_schema_expects_list(schema) and content_tokens < 300)
     )
     
     # BUG 7 FIX: path único por request para evitar race condition cuando hay concurrencia

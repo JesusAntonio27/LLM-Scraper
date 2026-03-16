@@ -380,6 +380,7 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             content = pre["markdown"] or "Contenido vacío"
             # FIX 3: actualizar caché de contenido y marcar URL como visitada
             self._last_page_content = content
+            self._last_page_html = fetch_result["html"]  # FIX C: HTML crudo para extract_links
             self._visited_urls.add(url)
             return content
 
@@ -401,6 +402,7 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             pre = preprocessor.process(fetch_result["html"])
             content = pre["markdown"] or "Sin cambios tras el click"
             self._last_page_content = content  # FIX 3: actualizar caché
+            self._last_page_html = fetch_result["html"]  # FIX C
             return content
 
         elif tool_name == "scroll_page":
@@ -428,6 +430,7 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             pre = preprocessor.process(fetch_result["html"])
             content = pre["markdown"] or "Sin cambios tras el scroll"
             self._last_page_content = content  # FIX 3: actualizar caché
+            self._last_page_html = fetch_result["html"]  # FIX C
             return content
 
         elif tool_name == "wait_and_get":
@@ -443,15 +446,24 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
             pre = preprocessor.process(fetch_result.get("html", ""))
             content = pre["markdown"] or "Sin contenido"
             self._last_page_content = content  # FIX 3: actualizar caché
+            self._last_page_html = fetch_result.get("html", "")  # FIX C
             return content
 
         elif tool_name == "extract_links":
-            fetch_result = await fetcher.fetch(url=current_url, **clean_opts)
-            if fetch_result["status"] == "failed":
-                return "[]"
+            # FIX C: si ya tenemos el HTML de esta URL en caché, evitar llamada a Oxylabs
+            if current_url in self._visited_urls and self._last_page_html:
+                logger.info("extract_links cache hit | url=%s", current_url)
+                html_to_parse = self._last_page_html
+            else:
+                fetch_result = await fetcher.fetch(url=current_url, **clean_opts)
+                if fetch_result["status"] == "failed":
+                    return "[]"
+                html_to_parse = fetch_result["html"]
+                self._last_page_html = html_to_parse
+                self._visited_urls.add(current_url)
             from bs4 import BeautifulSoup
             from urllib.parse import urljoin, urlparse
-            soup = BeautifulSoup(fetch_result["html"], "html.parser")
+            soup = BeautifulSoup(html_to_parse, "html.parser")
             pattern = tool_input.get("pattern", "")
             # FIX 6: si el patrón es URL completa, extraer solo el path para comparar con hrefs relativos
             if pattern.startswith("http"):
@@ -536,6 +548,8 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
 
         # FIX 3: caché del último contenido fetchado — evita llamadas extra a Oxylabs en get_current_content
         self._last_page_content: str = markdown  # inicializar con el markdown ya disponible
+        # FIX C: caché del HTML crudo — extract_links necesita HTML, no markdown procesado
+        self._last_page_html: str = ""  # se poblará en el primer fetch real
         # FIX 9: URLs ya visitadas — evita re-fetchear la misma página
         self._visited_urls: set = {url}  # la URL inicial ya fue fetchada por el pipeline
 
@@ -592,7 +606,13 @@ Si detectas un menú con categorías pero el contenido principal está vacío:
 NOTA sobre get_current_content():
 Retorna el Markdown del último fetch realizado. Es instantáneo y gratuito.
 Úsalo para leer el estado actual sin gastar un fetch nuevo.
-"""
+
+NOTA sobre click_element vs fetch_page:
+Si conoces la URL destino de un link, SIEMPRE usa fetch_page(url) en lugar de click_element().
+click_element() no actualiza la URL activa del agente — los tools subsecuentes (scroll, extract_links)
+seguirán operando sobre la URL anterior aunque el click haya navegado a otra página.
+Usa click_element() SOLO para acciones sin navegación: abrir dropdowns, activar tabs de SPA,
+expandir acordeones — donde el contenido cambia pero la URL no."""
 
         messages = [{
             "role": "user",
@@ -638,18 +658,35 @@ Si lo es, usa finish() con el JSON. Si no, navega la página para obtenerlos."""
                     tool_name = block.name
                     tool_input = block.input
 
-                    self._update_navigation_context(
-                        context_file, iteration, tool_name, tool_input
-                    )
-
                     if tool_name == "finish":
-                        final_data = tool_input.get("data", {})
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": "Navegación completada."
-                        })
-                        break
+                        candidate = tool_input.get("data", {})
+                        # FIX B: validar antes de aceptar — finish() con listas vacías
+                        # era silenciosamente devuelto como status="extracted" con data vacía.
+                        if self._validates_schema(candidate, schema):
+                            final_data = candidate
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": "Navegación completada."
+                            })
+                            break
+                        else:
+                            # Identificar qué listas están vacías para dar feedback preciso
+                            empty_keys = [
+                                k for k, v in candidate.items()
+                                if isinstance(v, list) and len(v) == 0
+                            ] if isinstance(candidate, dict) else ["data"]
+                            feedback = (
+                                f"Rechazado: el JSON tiene listas vacías en: {empty_keys}. "
+                                "Sigue navegando — extrae los datos reales antes de llamar finish(). "
+                                "Si ya intentaste todo y el sitio no tiene datos, usa give_up()."
+                            )
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": feedback
+                            })
+                            # NO hacer break — dejar que el loop continúe con el feedback
 
                     if tool_name == "give_up":
                         reason = tool_input.get("reason", "Sin razón especificada")
