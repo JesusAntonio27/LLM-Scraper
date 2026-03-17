@@ -324,8 +324,13 @@ class HtmlPreprocessor:
                         content = self._strategy_raw_html(html)
                         strategy_used = "raw_html"
                     
-            # Aplicar smart_truncate SOLO si no es raw_html
-            if strategy_used != "raw_html":
+            # FIX P3: raw_html también se trunca — sin límite podía llegar a 100K+ tokens
+            # al primer mensaje del loop agentic, degradando costo y rendimiento.
+            # Budget de 8000 (~32K chars) es suficiente para que el agente detecte
+            # estructura HTML y decida su estrategia de navegación.
+            if strategy_used == "raw_html":
+                content = self._smart_truncate(content, 8000)
+            else:
                 content = self._smart_truncate(content, token_budget)
                 
             content_hash = self._compute_hash(content)

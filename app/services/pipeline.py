@@ -1,4 +1,5 @@
 import asyncio
+import os
 import urllib.parse
 from app.config import settings
 from app.services.dedup import filter_urls, check_hash_changed
@@ -129,11 +130,11 @@ async def _process_single_url(url: str, schema: dict, output_hint: str, model: s
         if not s:
             return False
         # JSON Schema estándar: properties con type=array
+        # FIX P9: se elimina el check "any(isinstance(v, list) for v in s.values())"
+        # — en JSON Schema real los valores de properties son dicts {"type": "..."}, nunca
+        # listas de Python. Era código muerto que nunca se activaba en producción.
         props = s.get("properties", {})
-        if any(isinstance(v, dict) and v.get("type") == "array" for v in props.values()):
-            return True
-        # Schema simple (dict plano): algún valor es una lista
-        return any(isinstance(v, list) for v in s.values())
+        return any(isinstance(v, dict) and v.get("type") == "array" for v in props.values())
 
     content_tokens = pre_result.get("estimated_tokens") or 0
     auto_agentic = (
@@ -147,14 +148,26 @@ async def _process_single_url(url: str, schema: dict, output_hint: str, model: s
 
     if force_agentic or auto_agentic:
         # Modo agentic — Claude navega con tools
-        llm_result = await extractor.extract_agentic(
-            url=url,
-            markdown=pre_result["markdown"],
-            schema=schema,
-            output_hint=output_hint,
-            fetch_options=fetch_options,
-            context_file=context_file
-        )
+        # Inicializar con default seguro: si extract_agentic lanzara excepción no capturada
+        # antes de asignar llm_result, el finally limpia el archivo y llm_result tiene valor válido
+        llm_result = {"status": "failed", "data": None, "meta": {}}
+        try:
+            llm_result = await extractor.extract_agentic(
+                url=url,
+                markdown=pre_result["markdown"],
+                schema=schema,
+                output_hint=output_hint,
+                fetch_options=fetch_options,
+                context_file=context_file,
+                initial_html=fetch_result["html"]  # FIX P4: evita fetch extra en extract_links sobre URL inicial
+            )
+        finally:
+            # FIX P8: limpiar el context_file en todos los paths (éxito, fallo, excepción)
+            # sin esto, cada request agentic acumula un .md en el cwd indefinidamente
+            try:
+                os.unlink(context_file)
+            except FileNotFoundError:
+                pass
     else:
         # Modo normal — extracción directa
         llm_result = await extractor.extract(
@@ -165,6 +178,15 @@ async def _process_single_url(url: str, schema: dict, output_hint: str, model: s
             token_budget=token_budget
         )
     
+    # FIX P6: advertir en el meta cuando el sistema escaló a Sonnet automáticamente
+    # sin que el cliente lo solicitara — evita sorpresas de costo
+    if auto_agentic and not force_agentic:
+        llm_result.setdefault("meta", {})["agentic_escalation"] = True
+        llm_result["meta"]["agentic_trigger"] = (
+            "raw_html" if pre_result.get("strategy_used") == "raw_html"
+            else "thin_content"
+        )
+
     # Combinar metadata
     final_meta = {**llm_result.get("meta", {})}
     final_meta["fetch_ms"] = fetch_result.get("fetch_ms", 0)
@@ -206,20 +228,12 @@ async def run_discover(request: dict) -> dict:
     preprocessor = HtmlPreprocessor()
     pre_result = preprocessor.process(fetch_result["html"], token_budget=4000) # Ensure budget
     
-    # 3. LLM (Force sonnet)
+    # 3. LLM — método dedicado para generación de schema (FIX P7)
     extractor = LLMExtractor()
-    
-    discover_hint = (
-        "TASK: Analyze this markdown and generate a comprehensive JSON schema to extract all structured data. "
-        "Also provide extraction instructions and note any edge cases. "
-        f"USER HINT: {output_hint}"
-    )
-    
-    llm_result = await extractor.extract(
+
+    llm_result = await extractor.extract_schema_discovery(
         markdown=pre_result["markdown"],
-        schema={}, # No initial schema
-        output_hint=discover_hint,
-        model="sonnet",  # BUG 3 FIX: usar la key del MODEL_MAP, no el ID completo
+        output_hint=output_hint,
         token_budget=4000
     )
     
@@ -227,7 +241,7 @@ async def run_discover(request: dict) -> dict:
     return {
         "domain": urllib.parse.urlparse(url).netloc,
         "suggested_schema": llm_result.get("data", {}),
-        "suggested_instructions": "Ver la salida en suggested_schema. " + output_hint,
+        "suggested_instructions": output_hint or "Ver suggested_schema para la estructura inferida.",
         "confidence": 0.9 if llm_result.get("status") == "extracted" else 0.0,
         "notes": llm_result.get("raw_response", None) if llm_result.get("status") == "failed" else None,
         "meta": {

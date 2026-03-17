@@ -226,10 +226,12 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
         for key in schema.keys():
             if key not in data:
                 return False
-        # FIX 5: lista vacía no es una extracción válida — enmascara fallos reales
-        for value in data.values():
-            if isinstance(value, list) and len(value) == 0:
-                return False
+        # FIX P5: antes se rechazaba si CUALQUIER lista estaba vacía — un schema con
+        # "stores" y "promotions" fallaba si no había promociones aunque hubiera tiendas.
+        # Correcto: rechazar solo si TODAS las listas están vacías (extracción total fallida).
+        list_values = [v for v in data.values() if isinstance(v, list)]
+        if list_values and all(len(lst) == 0 for lst in list_values):
+            return False
         return True
 
     def _calculate_cost(self, model_id: str, input_tokens: int, output_tokens: int) -> float:
@@ -334,6 +336,131 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
                 }
             }
             
+        except Exception as e:
+            llm_ms = int((time.monotonic() - start_time) * 1000)
+            return {
+                "status": "failed",
+                "raw_response": str(e),
+                "meta": {
+                    "tokens_input": tokens_input,
+                    "tokens_output": tokens_output,
+                    "model_used": model_id,
+                    "cost_usd": round(cost_usd, 6),
+                    "llm_ms": llm_ms
+                }
+            }
+
+    # ── Descubrimiento de Schema ───────────────────────────────────
+
+    async def extract_schema_discovery(
+        self,
+        markdown: str,
+        output_hint: str,
+        token_budget: int = 4000
+    ) -> dict:
+        """
+        FIX P7: método dedicado para POST /extract/discover.
+        Tiene su propio system prompt orientado a GENERAR un JSON Schema,
+        no a extraer datos. Antes se abusaba de extract() con schema={},
+        lo que generaba una contradicción entre el system prompt ("cumple el schema")
+        y el hint ("genera el schema").
+        """
+        model_id = MODEL_MAP["sonnet"]
+        system_prompt = (
+            "Eres un analista de estructuras de datos web. "
+            "Tu tarea es analizar contenido Markdown de una página y generar "
+            "el JSON Schema óptimo para extraer sus datos estructurados. "
+            "Retorna ÚNICAMENTE un JSON Schema válido con 'type', 'properties' y sus tipos. "
+            "Sin backticks, sin explicaciones, sin texto adicional."
+        )
+        user_prompt = (
+            f"Hint del usuario: {output_hint}\n\n"
+            f"Contenido de la página:\n{markdown}\n\n"
+            "Genera el JSON Schema para extraer los datos estructurados de esta página."
+        )
+        retry_prompt = (
+            "El JSON que retornaste no es un JSON Schema válido. "
+            "Retorna un objeto con 'type': 'object' y 'properties' con los campos detectados. "
+            "Sin backticks, sin texto adicional."
+        )
+
+        start_time = time.monotonic()
+        tokens_input = 0
+        tokens_output = 0
+        cost_usd = 0.0
+
+        try:
+            response = await self.client.messages.create(
+                model=model_id,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=token_budget,
+            )
+            tokens_input += response.usage.input_tokens
+            tokens_output += response.usage.output_tokens
+            cost_usd += self._calculate_cost(model_id, response.usage.input_tokens, response.usage.output_tokens)
+
+            raw_text = response.content[0].text
+            parsed = self._try_parse_json(raw_text)
+
+            if parsed is not None and isinstance(parsed, dict) and len(parsed) > 0:
+                llm_ms = int((time.monotonic() - start_time) * 1000)
+                return {
+                    "status": "extracted",
+                    "data": parsed,
+                    "meta": {
+                        "tokens_input": tokens_input,
+                        "tokens_output": tokens_output,
+                        "model_used": model_id,
+                        "cost_usd": round(cost_usd, 6),
+                        "llm_ms": llm_ms
+                    }
+                }
+
+            # Reintento
+            retry_response = await self.client.messages.create(
+                model=model_id,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_prompt},
+                    {"role": "assistant", "content": raw_text},
+                    {"role": "user", "content": retry_prompt}
+                ],
+                max_tokens=token_budget,
+            )
+            tokens_input += retry_response.usage.input_tokens
+            tokens_output += retry_response.usage.output_tokens
+            cost_usd += self._calculate_cost(model_id, retry_response.usage.input_tokens, retry_response.usage.output_tokens)
+
+            retry_raw = retry_response.content[0].text
+            retry_parsed = self._try_parse_json(retry_raw)
+            llm_ms = int((time.monotonic() - start_time) * 1000)
+
+            if retry_parsed is not None and isinstance(retry_parsed, dict) and len(retry_parsed) > 0:
+                return {
+                    "status": "extracted",
+                    "data": retry_parsed,
+                    "meta": {
+                        "tokens_input": tokens_input,
+                        "tokens_output": tokens_output,
+                        "model_used": model_id,
+                        "cost_usd": round(cost_usd, 6),
+                        "llm_ms": llm_ms
+                    }
+                }
+
+            return {
+                "status": "failed",
+                "raw_response": retry_raw,
+                "meta": {
+                    "tokens_input": tokens_input,
+                    "tokens_output": tokens_output,
+                    "model_used": model_id,
+                    "cost_usd": round(cost_usd, 6),
+                    "llm_ms": llm_ms
+                }
+            }
+
         except Exception as e:
             llm_ms = int((time.monotonic() - start_time) * 1000)
             return {
@@ -532,7 +659,8 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
         output_hint: str,
         fetch_options: dict = None,
         context_file: str = "navigation_context.md",
-        max_iterations: int = 40
+        max_iterations: int = 40,
+        initial_html: str = ""
     ) -> dict:
         """
         Modo agentic: Claude decide si navegar y qué tools usar.
@@ -548,8 +676,9 @@ y en elementos h2/h3/h4/span/p dentro de componentes repetidos.
 
         # FIX 3: caché del último contenido fetchado — evita llamadas extra a Oxylabs en get_current_content
         self._last_page_content: str = markdown  # inicializar con el markdown ya disponible
-        # FIX C: caché del HTML crudo — extract_links necesita HTML, no markdown procesado
-        self._last_page_html: str = ""  # se poblará en el primer fetch real
+        # FIX P4: inicializar con el HTML crudo del pipeline — extract_links sobre la URL
+        # inicial ya no necesita hacer un fetch extra a Oxylabs
+        self._last_page_html: str = initial_html
         # FIX 9: URLs ya visitadas — evita re-fetchear la misma página
         self._visited_urls: set = {url}  # la URL inicial ya fue fetchada por el pipeline
 
@@ -633,7 +762,7 @@ Si lo es, usa finish() con el JSON. Si no, navega la página para obtenerlos."""
 
                 response = await self.client.messages.create(
                     model=model_id,
-                    max_tokens=4096,
+                    max_tokens=16384,  # FIX P2: 4096 cortaba finish() con 60+ registros → JSON malformado
                     system=system,
                     tools=NAVIGATION_TOOLS,
                     messages=messages
@@ -686,7 +815,10 @@ Si lo es, usa finish() con el JSON. Si no, navega la página para obtenerlos."""
                                 "tool_use_id": block.id,
                                 "content": feedback
                             })
-                            # NO hacer break — dejar que el loop continúe con el feedback
+                            # FIX P1: continuar al siguiente bloque — sin continue, el flujo
+                            # caía en _execute_tool("finish",...) y agregaba un segundo
+                            # tool_result con el mismo tool_use_id → error 400 de Anthropic API
+                            continue
 
                     if tool_name == "give_up":
                         reason = tool_input.get("reason", "Sin razón especificada")
